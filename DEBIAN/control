@@ -1,0 +1,9 @@
+Package: hanska-ai-stop
+Version: 1.0.0
+Section: utils
+Priority: optional
+Architecture: all
+Depends: python3, zenity
+Maintainer: HANSKA <local@localhost>
+Description: Detiene los agentes de IA locales del usuario
+ Acceso directo para detener Harness, Claude, Codex CLI, OpenCode y Ollama.

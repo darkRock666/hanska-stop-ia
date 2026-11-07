@@ -1,0 +1,111 @@
+#!/usr/bin/python3
+"""Stop recognized local AI agents and their descendants for the current user."""
+import argparse
+import os
+from pathlib import Path
+import signal
+import subprocess
+import time
+
+NAMES = {'claude', 'codex', 'opencode', 'ollama', 'llama-server', 'llama-cli', 'dsh', 'deepseek-harness'}
+
+def snapshot():
+    result = {}
+    for path in Path('/proc').iterdir():
+        if not path.name.isdigit():
+            continue
+        try:
+            if path.stat().st_uid != os.getuid():
+                continue
+            raw = (path / 'stat').read_text()
+            fields = raw[raw.rfind(')') + 2:].split()
+            args = [v.decode(errors='replace') for v in (path / 'cmdline').read_bytes().split(b'\0') if v]
+            if args and fields[0] != 'Z':
+                result[int(path.name)] = (int(fields[1]), fields[19], args)
+        except (OSError, ValueError, IndexError):
+            continue
+    return result
+
+def recognized(args):
+    exe = Path(args[0]).name
+    # The desktop app is not a CLI agent. Never match arbitrary argument text.
+    if exe in NAMES:
+        return True
+    if exe.startswith('ollama_'):
+        return True
+    if exe in {'node', 'nodejs', 'bun', 'python', 'python3', 'bash', 'sh'}:
+        for arg in args[1:3]:
+            if arg.startswith('-'):
+                continue
+            name = Path(arg).name
+            if name in {'hanska-ai-launcher', 'hanska-launcher-real.sh'}:
+                return True
+            if name in NAMES:
+                return True
+            if any(part in arg for part in ('/@deepseek-ai/dsh/', '/@anthropic-ai/claude-code/', '/@openai/codex/', '/opencode-ai/')):
+                return True
+    if exe in {'npm', 'npx'} or exe.startswith(('npm exec', 'npm start')):
+        return any(arg == '@deepseek-ai/dsh' or arg.startswith('npm exec @deepseek-ai/dsh') for arg in args)
+    return False
+
+def targets(processes):
+    protected = {os.getpid()}
+    parent = os.getppid()
+    while parent in processes and parent not in protected:
+        protected.add(parent)
+        parent = processes[parent][0]
+    selected = {pid for pid, (_, _, args) in processes.items() if recognized(args) and pid not in protected}
+    while True:
+        children = {pid for pid, (ppid, _, _) in processes.items() if ppid in selected and pid not in protected}
+        added = children - selected
+        if not added:
+            return selected
+        selected.update(added)
+
+def same_process(pid, expected):
+    try:
+        raw = Path(f'/proc/{pid}/stat').read_text()
+        fields = raw[raw.rfind(')') + 2:].split()
+        return fields[0] != 'Z' and fields[19] == expected[1]
+    except (OSError, IndexError):
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dry-run', action='store_true', help='Mostrar objetivos sin detenerlos')
+    parser.add_argument('--no-gui', action='store_true')
+    options = parser.parse_args()
+    processes = snapshot()
+    selected = targets(processes)
+    if options.dry_run:
+        for pid in sorted(selected):
+            print(f'{pid}: {Path(processes[pid][2][0]).name}')
+        print(f'{len(selected)} procesos de IA detectados.')
+        return
+    failures = set()
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in selected:
+            if same_process(pid, processes[pid]):
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    failures.add(pid)
+        deadline = time.monotonic() + (5 if sig == signal.SIGTERM else 1)
+        while any(same_process(pid, processes[pid]) for pid in selected) and time.monotonic() < deadline:
+            time.sleep(0.1)
+    remaining = {pid for pid in selected if same_process(pid, processes[pid])}
+    message = (f'Se detuvieron {len(selected) - len(remaining)} procesos de IA.' if selected else 'No hay procesos de IA locales de tu usuario en ejecución.')
+    if remaining:
+        message += f' No se pudieron detener {len(remaining)} procesos.'
+    print(message)
+    if not options.no_gui:
+        try:
+            subprocess.run(['zenity', '--warning' if remaining else '--info', '--title=HANSKA STOP IA', '--text=' + message], timeout=120, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return 1 if remaining else 0
+
+if __name__ == '__main__':
+    raise SystemExit(main())
